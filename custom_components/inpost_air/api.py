@@ -2,9 +2,11 @@
 
 import asyncio
 from dataclasses import dataclass
+import json
 import logging
 import re
-from aiohttp import ClientResponse, ClientResponseError
+from typing import Any
+from aiohttp import ClientResponseError
 from dacite import from_dict
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_create_clientsession
@@ -12,6 +14,24 @@ from custom_components.inpost_air.models import InPostAirPoint
 from custom_components.inpost_air.utils import get_parcel_locker_url
 
 _LOGGER = logging.getLogger(__name__)
+
+REQUEST_TIMEOUT = 30
+
+AIR_DATA_PATTERN = re.compile(
+    r"data-shipx-url=\"/shipx-point-data/(.*?)/(.*?)/air_index_level\""
+)
+
+
+@dataclass
+class ApiResponse:
+    """API response with an already read body."""
+
+    url: str
+    body: str
+
+    def json(self) -> Any:
+        """Parse the body as JSON."""
+        return json.loads(self.body)
 
 
 @dataclass
@@ -43,10 +63,15 @@ class InPostApi:
         url: str,
         headers: dict | None = None,
         raise_client_response_error: bool = False,
-    ) -> ClientResponse:
-        """Get information from the API."""
+    ) -> ApiResponse:
+        """Get information from the API.
+
+        The body is read inside the timeout on purpose - `session.request`
+        returns as soon as the response headers arrive, so reading the body
+        outside of it would leave that part of the request without any limit.
+        """
         try:
-            async with asyncio.timeout(30):
+            async with asyncio.timeout(REQUEST_TIMEOUT):
                 response = await self.session.request(
                     method=method,
                     url=url,
@@ -54,23 +79,25 @@ class InPostApi:
                 )
                 response.raise_for_status()
 
-                return response
+                return ApiResponse(url=str(response.url), body=await response.text())
 
         except TimeoutError as e:
-            _LOGGER.warning("Request timed out")
+            _LOGGER.warning("Request to %s timed out", url)
             raise InPostAirApiClientError("Request timed out") from e
         except ClientResponseError as e:
             if raise_client_response_error:
                 raise
-            raise InPostAirApiClientError("Something really wrong happened!") from e
+            _LOGGER.warning("Request to %s failed with status %s", url, e.status)
+            raise InPostAirApiClientError(
+                f"Request to {url} failed with status {e.status}"
+            ) from e
         except Exception as exception:  # pylint: disable=broad-except
+            _LOGGER.warning("Request to %s failed: %s", url, exception)
             raise InPostAirApiClientError(
                 "Something really wrong happened!"
             ) from exception
 
-    async def _search_easypack24_locker(
-        self, locker_code: str
-    ) -> InPostAirPoint | None:
+    async def _search_easypack24_locker(self, locker_code: str) -> dict | None:
         """Find info about given parcel locker."""
         if not locker_code or locker_code == "":
             return None
@@ -79,7 +106,7 @@ class InPostApi:
             method="get",
             url="https://api-shipx-pl.easypack24.net/v1/points/" + locker_code,
         )
-        resp = await response.json()
+        resp = response.json()
 
         error = resp.get("error")
         if error:
@@ -120,11 +147,7 @@ class InPostApi:
             method="get", url="https://inpost.pl/sites/default/files/points.json"
         )
         parcel_locker = next(
-            (
-                x
-                for x in (await response.json()).get("items")
-                if x.get("n") == locker_code
-            ),
+            (x for x in response.json().get("items") if x.get("n") == locker_code),
             None,
         )
 
@@ -133,27 +156,54 @@ class InPostApi:
 
         return from_dict(InPostAirPoint, parcel_locker) if parcel_locker else None
 
+    async def refresh_parcel_locker(self, locker_code: str) -> InPostAirPoint | None:
+        """Get current data of an already known parcel locker.
+
+        Data stored in a config entry gets outdated when InPost changes details
+        of a parcel locker, so it has to be refetched. The single point endpoint
+        is tried first - the full list is a few megabytes of JSON.
+        """
+        parcel_locker = await self._search_easypack24_locker(locker_code)
+
+        if parcel_locker is None:
+            return await self.search_parcel_locker(locker_code)
+
+        return from_dict(InPostAirPoint, parcel_locker)
+
     async def get_parcel_lockers_list(self) -> list[InPostAirPoint]:
         """Get parcel lockers list."""
         response = await self._request(
             method="get", url="https://inpost.pl/sites/default/files/points.json"
         )
-        response_data = from_dict(ParcelLockerListResponse, await response.json())
+        response_data = from_dict(ParcelLockerListResponse, response.json())
 
         return response_data.items
 
     async def find_parcel_locker_id(self, point: InPostAirPoint) -> str | None:
         """Find parcel locker ID by its code."""
-        response = await self._request(
-            method="get",
-            url=get_parcel_locker_url(point),
-        )
-        match = re.search(
-            r"data-shipx-url=\"/shipx-point-data/(.*?)/(.*?)/air_index_level\"",
-            await response.text(),
-        )
+        url = get_parcel_locker_url(point)
+        response = await self._request(method="get", url=url)
 
-        return None if match is None else match.group(1)
+        if response.url.rstrip("/") != url.rstrip("/"):
+            _LOGGER.warning(
+                "Page of parcel locker %s (%s) redirected to %s - data stored for that parcel locker is outdated",
+                point.n,
+                url,
+                response.url,
+            )
+            return None
+
+        match = AIR_DATA_PATTERN.search(response.body)
+
+        if match is None:
+            _LOGGER.warning(
+                "Could not find air quality data of parcel locker %s on %s",
+                point.n,
+                url,
+            )
+            return None
+
+        return match.group(1)
 
     async def get_parcel_locker_air_data(
         self, locker_code: str, locker_id: str
@@ -171,11 +221,11 @@ class InPostApi:
                 raise InPostAirApiClientSensorsMissingError(
                     "Air sensors are not available"
                 ) from e
-            raise InPostAirApiClientError("Something really wrong happened!") from e
-        except:
-            raise
+            raise InPostAirApiClientError(
+                f"Request for air data of parcel locker {locker_code} failed with status {e.status}"
+            ) from e
 
-        return from_dict(ParcelLockerAirDataResponse, await response.json())
+        return from_dict(ParcelLockerAirDataResponse, response.json())
 
 
 class InPostAirApiClientError(Exception):

@@ -1,7 +1,7 @@
 """Config flow for InPost Air integration."""
 
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
 import logging
 from typing import Any
@@ -48,7 +48,13 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> InPostAir
 
     try:
         parcel_locker_id = await api_client.find_parcel_locker_id(parcel_locker)
+
+        if parcel_locker_id is None:
+            raise ParcelLockerWithoutAirData
+
         await api_client.get_parcel_locker_air_data(parcel_locker.n, parcel_locker_id)
+    except ParcelLockerWithoutAirData:
+        raise
     except Exception as exc:
         raise ParcelLockerWithoutAirData from exc
 
@@ -79,7 +85,7 @@ class InPostAirConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             else:
                 return self.async_create_entry(
                     title=f"Parcel locker {parcel_locker.n}",
-                    data={"parcel_locker": parcel_locker},
+                    data={"parcel_locker": asdict(parcel_locker)},
                 )
 
         parcel_lockers = [

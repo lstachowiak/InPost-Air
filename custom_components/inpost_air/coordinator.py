@@ -7,10 +7,15 @@ import logging
 import re
 
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryError
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .models import ParcelLocker
-from .api import InPostAirApiClientError, InPostApi
+from .api import (
+    InPostAirApiClientError,
+    InPostAirApiClientSensorsMissingError,
+    InPostApi,
+)
 from .const import Entities
 
 _LOGGER = logging.getLogger(__name__)
@@ -90,7 +95,11 @@ class InPostAirDataCoordinator(DataUpdateCoordinator):
                 return {
                     x.name: x for line in data.air_sensors if (x := create_value(line))
                 }
+        except InPostAirApiClientSensorsMissingError as err:
+            # Nothing to poll for - retrying will not help, so let the config
+            # entry fail permanently instead of ending up in a retry loop.
+            raise ConfigEntryError(err) from err
         except InPostAirApiClientError as err:
             raise UpdateFailed(err) from err
         except Exception as err:
-            raise UpdateFailed("Error communicating with API") from err
+            raise UpdateFailed(f"Error communicating with API: {err}") from err

@@ -1,7 +1,7 @@
 """The InPost Air integration."""
 
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import logging
 
 from dacite import from_dict
@@ -15,7 +15,7 @@ from custom_components.inpost_air.coordinator import InPostAirDataCoordinator
 from custom_components.inpost_air.models import ParcelLocker
 from custom_components.inpost_air.utils import get_device_info, get_parcel_locker_url
 
-from .api import InPostAirPoint, InPostApi
+from .api import InPostAirApiClientError, InPostAirPoint, InPostApi
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -35,34 +35,80 @@ type InPostAirConfiEntry = ConfigEntry[InPostAirData]
 PLATFORMS: list[Platform] = [Platform.SENSOR]
 
 
+def get_configured_point(entry: InPostAirConfiEntry) -> InPostAirPoint:
+    """Read parcel locker data stored in the config entry."""
+    entry_data = entry.data.get("parcel_locker")
+
+    if entry_data is None:
+        raise ConfigEntryError(
+            "Config entry does not contain any parcel locker data. "
+            "Please remove the integration and set it up again."
+        )
+
+    if isinstance(entry_data, InPostAirPoint):
+        return entry_data
+
+    try:
+        return from_dict(InPostAirPoint, entry_data)
+    except Exception as ex:
+        raise ConfigEntryError(
+            f"Parcel locker data stored in the config entry is invalid: {ex}"
+        ) from ex
+
+
+async def resolve_parcel_locker(
+    hass: HomeAssistant,
+    entry: InPostAirConfiEntry,
+    api_client: InPostApi,
+    point: InPostAirPoint,
+) -> tuple[InPostAirPoint, str]:
+    """Find the parcel locker ID, refreshing outdated config entry data if needed."""
+    refreshed_point = None
+
+    try:
+        if (locker_id := await api_client.find_parcel_locker_id(point)) is not None:
+            return point, locker_id
+
+        _LOGGER.info(
+            "Refetching data of parcel locker %s - the one stored in the config entry might be outdated",
+            point.n,
+        )
+        refreshed_point = await api_client.refresh_parcel_locker(point.n)
+
+        if refreshed_point is not None and refreshed_point != point:
+            locker_id = await api_client.find_parcel_locker_id(refreshed_point)
+    except InPostAirApiClientError as err:
+        # Transient problem on InPost side - let Home Assistant retry the setup.
+        raise ConfigEntryNotReady(f"Error communicating with InPost: {err}") from err
+
+    if locker_id is None:
+        raise ConfigEntryNotReady(
+            f"Could not find air quality data of parcel locker {point.n} on {get_parcel_locker_url(point)}"
+        )
+
+    hass.config_entries.async_update_entry(
+        entry,
+        data={**entry.data, "parcel_locker": asdict(refreshed_point)},
+    )
+
+    return refreshed_point, locker_id
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: InPostAirConfiEntry) -> bool:
     """Set up InPost Air from a config entry."""
     api_client = InPostApi(hass)
-    entry_data = entry.data.get("parcel_locker")
+    point = get_configured_point(entry)
 
-    if (
-        point := None
-        if entry_data is None
-        else entry_data
-        if isinstance(entry_data, InPostAirPoint)
-        else from_dict(InPostAirPoint, entry_data)
-    ) is None:
-        return False
-
-    if (parcel_locker_id := await api_client.find_parcel_locker_id(point)) is None:
-        return False
+    point, parcel_locker_id = await resolve_parcel_locker(
+        hass, entry, api_client, point
+    )
 
     parcel_locker = ParcelLocker(point.n, parcel_locker_id)
     coordinator = InPostAirDataCoordinator(hass, api_client, parcel_locker)
 
     entry.runtime_data = InPostAirData(parcel_locker, coordinator)
 
-    try:
-        await coordinator.async_config_entry_first_refresh()
-    except ConfigEntryNotReady as ex:
-        if "Air sensors are not available" in str(ex):
-            raise ConfigEntryError(ex)
-        raise ex
+    await coordinator.async_config_entry_first_refresh()
 
     device_registry = dr.async_get(hass)
     device_registry.async_get_or_create(
@@ -92,12 +138,19 @@ async def async_migrate_entry(hass: HomeAssistant, config_entry: InPostAirConfiE
 
     if config_entry.version > 2:
         # This means the user has downgraded from a future version
+        _LOGGER.error(
+            "Cannot migrate %s from version %s - it was created by a newer version of the integration",
+            config_entry.title,
+            config_entry.version,
+        )
         return False
 
     if config_entry.version == 1:
         hass.config_entries.async_update_entry(
             config_entry,
-            data={"parcel_locker": from_dict(InPostAirPoint, config_entry.data)},
+            data={
+                "parcel_locker": asdict(from_dict(InPostAirPoint, config_entry.data))
+            },
             version=2,
         )
 
